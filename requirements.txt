@@ -12,3 +12,7 @@ tiktoken>=0.4.0
 accelerate>=0.26.0
 datasets
 scikit-learn
+evaluate
+rouge_score
+nltk
+absl-py

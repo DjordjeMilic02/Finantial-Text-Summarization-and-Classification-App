@@ -1,7 +1,11 @@
 from transformers import pipeline
 
-def summarize_text(input_path="input/input.txt", output_path="output/outputBART.txt"):
-    summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+def summarize_text(
+    input_path="input/input.txt",
+    output_path="output/outputBART.txt",
+    model_path="./bart-financial-finetuned-final"
+):
+    summarizer = pipeline("summarization", model=model_path, tokenizer=model_path)
 
     with open(input_path, "r", encoding="utf-8") as f:
         text = f.read()
