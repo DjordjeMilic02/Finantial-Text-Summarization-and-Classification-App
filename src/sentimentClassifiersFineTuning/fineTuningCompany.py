@@ -55,7 +55,6 @@ def is_valid_row(ex: Dict[str, Any]) -> bool:
     return isinstance(t, str) and isinstance(y, str) and t.strip() != "" and y.strip() != ""
 
 def load_aiera_all():
-    """Load Aiera/aiera-transcript-sentiment and normalize to 'text','label'."""
     ds = load_dataset("Aiera/aiera-transcript-sentiment")
     outs = []
     def norm(ex):
