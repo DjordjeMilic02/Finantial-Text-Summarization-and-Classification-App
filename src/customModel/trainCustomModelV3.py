@@ -40,7 +40,7 @@ DROPOUT   = 0.1
 
 BATCH_SIZE    = 2
 GRAD_ACCUM    = 8
-EPOCHS        = 12
+EPOCHS        = 15
 LR            = 2e-4
 WARMUP_RATIO  = 0.1
 WEIGHT_DECAY  = 1e-4
@@ -51,6 +51,7 @@ NUM_WORKERS   = 0
 
 USE_FOCAL     = False
 FOCAL_GAMMA   = 1.5
+LABEL_SMOOTH  = 0.05
 
 def load_csv(path: Path):
     assert path.exists(), f"CSV not found: {path}"
@@ -101,15 +102,19 @@ def pad_or_crop(ids: List[int], max_len: int, rng: np.random.Generator=None) -> 
     return ids[start:start+max_len]
 
 class TrainSeqDataset(torch.utils.data.Dataset):
-    def __init__(self, docs_ids: List[List[int]], max_len=MAX_LEN_TRAIN, seed=SEED):
+    def __init__(self, docs_ids: List[List[int]], labels: List[int],
+                 max_len=MAX_LEN_TRAIN, seed=SEED):
+        assert len(docs_ids) == len(labels)
         self.docs = docs_ids
+        self.labels = labels
         self.max_len = max_len
         self.rng = np.random.default_rng(seed)
     def __len__(self): return len(self.docs)
     def __getitem__(self, i):
         ids = self.docs[i]
         x = pad_or_crop(ids, self.max_len, rng=self.rng)
-        return torch.tensor(x, dtype=torch.long)
+        y = self.labels[i]
+        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
 class ChunkedEvalDataset(torch.utils.data.Dataset):
     def __init__(self, docs_ids: List[List[int]], max_len=MAX_LEN_EVAL, stride=EVAL_STRIDE):
@@ -137,7 +142,9 @@ class ChunkedEvalDataset(torch.utils.data.Dataset):
         }
 
 def collate_ids(batch):
-    return torch.stack(batch, dim=0)
+    xs = torch.stack([b[0] for b in batch], dim=0)
+    ys = torch.stack([b[1] for b in batch], dim=0)
+    return xs, ys
 
 def collate_chunked(batch):
     return {
@@ -146,7 +153,6 @@ def collate_chunked(batch):
     }
 
 def sinusoidal_positions(T: int, D: int, device):
-    # [T, D]
     pe = torch.zeros(T, D, device=device)
     pos = torch.arange(0, T, dtype=torch.float32, device=device).unsqueeze(1)
     div = torch.exp(torch.arange(0, D, 2, dtype=torch.float32, device=device) * (-math.log(10000.0)/D))
@@ -168,25 +174,31 @@ class MultiheadLinearAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def feature_map(self, x):
-        return F.elu(x, alpha=1.0) + 1.0
+        return F.elu(x / math.sqrt(self.d_head), alpha=1.0) + 1.0
 
     def forward(self, x, key_padding_mask=None):
         B,T,D = x.size()
         H, Dh = self.n_heads, self.d_head
-        q = self.q_proj(x).view(B, T, H, Dh).transpose(1,2)
-        k = self.k_proj(x).view(B, T, H, Dh).transpose(1,2)
-        v = self.v_proj(x).view(B, T, H, Dh).transpose(1,2)
+
+        x32 = x.float()
+        q = self.q_proj(x32).view(B, T, H, Dh).transpose(1,2)
+        k = self.k_proj(x32).view(B, T, H, Dh).transpose(1,2)
+        v = self.v_proj(x32).view(B, T, H, Dh).transpose(1,2)
 
         q = self.feature_map(q)
         k = self.feature_map(k)
 
         if key_padding_mask is None:
-            mask = torch.ones(B, 1, T, 1, device=x.device, dtype=x.dtype)
+            mask = torch.ones(B, T, device=x.device, dtype=torch.float32)
         else:
-            mask = key_padding_mask[:, None, :, None].to(dtype=x.dtype)
+            mask = key_padding_mask.float()
 
-        k = k * mask
-        v = v * mask
+        m_q = mask[:, None, :, None]
+        m_kv = mask[:, None, :, None]
+
+        q = q * m_q
+        k = k * m_kv
+        v = v * m_kv
 
         KV   = torch.einsum("bhtd,bhtf->bhdf", k, v)
         Ksum = k.sum(dim=2)
@@ -196,9 +208,11 @@ class MultiheadLinearAttention(nn.Module):
 
         eps = 1e-6
         out = num / (den + eps)
+
         out = out.transpose(1,2).contiguous().view(B, T, D)
-        out = self.dropout(self.out_proj(out))
-        return out
+        out = self.out_proj(out)
+        out = self.dropout(out)
+        return out.to(x.dtype)
 
 class TransformerBlockLA(nn.Module):
     def __init__(self, d_model, n_heads, mlp_hidden, dropout=0.1):
@@ -227,6 +241,9 @@ class LongTXClassifier(nn.Module):
     def __init__(self, vocab_size, num_classes):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, D_MODEL, padding_idx=PAD_IDX)
+        nn.init.normal_(self.emb.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.emb.weight[PAD_IDX].zero_()
         self.drop = nn.Dropout(DROPOUT)
         self.blocks = nn.ModuleList([TransformerBlockLA(D_MODEL, N_HEADS, MLP_HID, dropout=DROPOUT) for _ in range(DEPTH)])
         self.norm = nn.LayerNorm(D_MODEL)
@@ -241,14 +258,14 @@ class LongTXClassifier(nn.Module):
         return x + self.cached_pe[:T]
 
     def forward(self, x_ids):
-        key_padding_mask = (x_ids != PAD_IDX).to(x_ids.dtype)
+        key_padding_mask = (x_ids != PAD_IDX)
         x = self.emb(x_ids)
         x = self.add_pos(x)
         x = self.drop(x)
         for blk in self.blocks:
             x = blk(x, key_padding_mask=key_padding_mask)
         x = self.norm(x)
-        mask = (x_ids != PAD_IDX).float().unsqueeze(-1)
+        mask = key_padding_mask.float().unsqueeze(-1)
         s = (x * mask).sum(dim=1)
         z = mask.sum(dim=1).clamp(min=1.0)
         doc = s / z
@@ -287,7 +304,7 @@ def per_class_report(preds, refs, K):
 
 def ce_or_focal(logits, y, weight=None):
     if not USE_FOCAL:
-        return F.cross_entropy(logits, y, weight=weight)
+        return F.cross_entropy(logits, y, weight=weight, label_smoothing=LABEL_SMOOTH)
     logp = F.log_softmax(logits, dim=-1)
     ce   = F.nll_loss(logp, y, weight=weight, reduction="none")
     with torch.no_grad():
@@ -311,8 +328,7 @@ def predict_docs_chunked(model, docs_ids, batch_size=2, window=MAX_LEN_EVAL, str
     for batch in pbar(dl, desc="Eval", total=len(dl)):
         sids = batch["sample_id"].tolist()
         x = batch["input_ids"].to(device)
-        with torch.amp.autocast('cuda', enabled=(device.type=='cuda')):
-            logits = model(x).detach().cpu().numpy()
+        logits = model(x).detach().cpu().numpy()
         for j, sid in enumerate(sids): all_logits[sid].append(logits[j])
     n_docs = len(docs_ids)
     out = np.zeros((n_docs, model.fc.out_features), dtype=np.float32)
@@ -360,7 +376,7 @@ def main():
     va_ids = [encode_ids(t, stoi) for t in pbar(va_texts, desc="Encode val")]
     te_ids = [encode_ids(t, stoi) for t in pbar(te_texts, desc="Encode test")]
 
-    train_ds = TrainSeqDataset(tr_ids, max_len=MAX_LEN_TRAIN, seed=SEED)
+    train_ds = TrainSeqDataset(tr_ids, tr_y, max_len=MAX_LEN_TRAIN, seed=SEED)
     train_dl = torch.utils.data.DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                                            num_workers=NUM_WORKERS, pin_memory=True, drop_last=True,
                                            collate_fn=collate_ids)
@@ -372,7 +388,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model  = LongTXClassifier(vocab_size=V, num_classes=K).to(device)
     opt    = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scaler = torch.amp.GradScaler('cuda', enabled=(device.type=='cuda'))
 
     total_steps = EPOCHS * (len(train_dl) // max(1, GRAD_ACCUM))
     warmup_steps = int(WARMUP_RATIO * total_steps) if total_steps > 0 else 0
@@ -389,23 +404,23 @@ def main():
         running, seen = 0.0, 0
         opt.zero_grad(set_to_none=True)
         it = pbar(train_dl, total=len(train_dl), desc=f"Train ep{epoch}")
-        for i, xb in enumerate(it, start=1):
+        for i, (xb, yb) in enumerate(it, start=1):
             xb = xb.to(device, non_blocking=True)
-            yb = torch.tensor([tr_y[j] for j in np.random.randint(0, len(tr_y), size=xb.size(0))],
-                              dtype=torch.long, device=device)
-            with torch.amp.autocast('cuda', enabled=(device.type=='cuda')):
-                logits = model(xb)
-                loss = ce_or_focal(logits, yb, weight=class_weights.to(device))
-                loss = loss / GRAD_ACCUM
-            scaler.scale(loss).backward()
+            yb = yb.to(device, non_blocking=True)
+            logits = model(xb)
+            loss = ce_or_focal(logits, yb, weight=class_weights.to(device))
+            if torch.isnan(loss) or torch.isinf(loss):
+                print("WARNING: loss is NaN/Inf; skipping batch.")
+                opt.zero_grad(set_to_none=True)
+                continue
+            loss = loss / GRAD_ACCUM
+            loss.backward()
             if i % GRAD_ACCUM == 0:
-                scaler.unscale_(opt)
                 nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
                 step += 1
                 lr = cosine_with_warmup(step, total_steps, warmup_steps, LR)
                 for g in opt.param_groups: g['lr'] = lr
-                scaler.step(opt); scaler.update()
-                opt.zero_grad(set_to_none=True)
+                opt.step(); opt.zero_grad(set_to_none=True)
             running += float(loss.item()) * xb.size(0) * GRAD_ACCUM
             seen += xb.size(0)
             it.set_postfix(loss=f"{running/max(1,seen):.4f}", lr=f"{opt.param_groups[0]['lr']:.2e}")
@@ -414,8 +429,10 @@ def main():
         va_logits = predict_docs_chunked(model, va_ids, batch_size=max(1,BATCH_SIZE), device=device)
         va_preds = va_logits.argmax(axis=-1)
         va_acc = accuracy(va_preds, np.array(va_y)); va_f1 = macro_f1(va_preds, np.array(va_y), K)
+        pred_dist = np.bincount(va_preds, minlength=K).tolist()
         dt = time.time() - t0
         print(f"Epoch {epoch:02d}  {dt:.1f}s  train_loss={running/max(1,seen):.4f}  val_acc={va_acc:.4f}  val_f1={va_f1:.4f}")
+        print(f"  Val pred dist: {pred_dist}")
 
         if va_f1 > best_f1:
             best_f1 = va_f1; patience = PATIENCE

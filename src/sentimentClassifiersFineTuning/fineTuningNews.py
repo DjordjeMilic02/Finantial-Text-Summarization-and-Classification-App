@@ -115,11 +115,6 @@ def make_weighted_sampler(dataset, num_labels, neg_id):
     return WeightedRandomSampler(weights, num_samples=len(labels), replacement=True)
 
 def read_opendatabay_csv(path: str) -> Dataset:
-    """
-    Reads CSV with expected columns:
-    Date_published, Headline, Synopsis, Full_text, Final Status
-    Produces HF Dataset with columns: text, label
-    """
     assert os.path.exists(path), f"CSV not found at {path}. Please place the file there."
     rows = []
     with open(path, "r", encoding="utf-8-sig") as f:

@@ -10,7 +10,7 @@ LABEL_MAP = {
 }
 
 def main():
-    input_file = os.path.join("input", "testInputNews.txt")
+    input_file = os.path.join("input", "testInputCompany.txt")
     if not os.path.exists(input_file):
         print(f"[ERROR] File not found: {input_file}")
         return

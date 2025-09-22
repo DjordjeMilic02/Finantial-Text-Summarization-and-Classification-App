@@ -62,7 +62,6 @@ def is_valid_row(ex: Dict[str, Any]) -> bool:
 
 
 def load_flare_fomc_all():
-    """Load retarfi/flare-fomc and normalize to columns: text, label."""
     ds = load_dataset("retarfi/flare-fomc")
     outs = []
     def norm(ex):

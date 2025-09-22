@@ -54,7 +54,6 @@ def parse_date_from_filename(name: str) -> Optional[str]:
     return f"{yyyy}-{mm}-{dd}"
 
 def scan_custom_root(root: Path) -> List[Dict]:
-    """Scan customDataset/(CUR)/year/ddmmyyyy.txt -> rows with value, text, currency, date."""
     if not root.exists():
         raise FileNotFoundError(f"Input root not found: {root.resolve()}")
     rows = []
@@ -79,7 +78,6 @@ def scan_custom_root(root: Path) -> List[Dict]:
     return rows
 
 def impute_values(rows: List[Dict]) -> None:
-    """Impute missing 'value' with currency mean; fallback to global mean."""
     per_cur_vals: Dict[str, List[float]] = {}
     for r in rows:
         if r["value"] is not None:
@@ -92,7 +90,6 @@ def impute_values(rows: List[Dict]) -> None:
             r["value"] = per_cur_mean.get(r["currency"]) if per_cur_mean.get(r["currency"]) is not None else global_mean
 
 def compute_tertiles(values: np.ndarray) -> Tuple[float,float]:
-    """Global tertiles for ~equal 1/3 splits across all currencies."""
     q1 = float(np.nanquantile(values, 1/3))
     q2 = float(np.nanquantile(values, 2/3))
     return q1, q2
@@ -103,7 +100,6 @@ def label_from_value(v: float, low_thr: float, high_thr: float) -> str:
     return "neutral"
 
 def load_fomc_rows() -> List[Dict]:
-    """Use ALL available splits; map label_text; ignore originals when splitting later."""
     if not HAS_DATASETS:
         print("WARNING: 'datasets' not installed; skipping FOMC.")
         return []
@@ -133,7 +129,6 @@ def load_fomc_rows() -> List[Dict]:
     return rows
 
 def load_ecb_rows() -> List[Dict]:
-    """Gather ALL configs/splits from gtfintechlab/european_central_bank, skip 'irrelevant'."""
     if not HAS_DATASETS:
         print("WARNING: 'datasets' not installed; skipping ECB.")
         return []
@@ -192,7 +187,6 @@ def write_csv(rows: List[Dict], out_csv: Path) -> None:
             w.writerow({c: r.get(c, "") for c in cols})
 
 def stratified_split_indices(labels: List[str], test_ratio=0.10, seed=SEED):
-    """Return (train_idx, test_idx) stratified by label."""
     rng = np.random.default_rng(seed)
     by_lbl: Dict[str, List[int]] = {}
     for i, y in enumerate(labels):
