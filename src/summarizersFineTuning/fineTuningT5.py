@@ -26,7 +26,7 @@ def build_args():
     p.add_argument("--num_epochs", type=int, default=3)
     p.add_argument("--beam_size", type=int, default=4)
     p.add_argument("--fp16", action="store_true")
-    p.add_argument("--quick_test", action="store_true", help="Tiny slices for a smoke test")
+    p.add_argument("--quick_test", action="store_true", help="Tiny slices")
     return p.parse_args()
 
 def is_valid_example(ex: Dict[str, Any]) -> bool:

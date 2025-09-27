@@ -1,4 +1,5 @@
 import os
+import csv
 from collections import Counter
 from typing import Dict, Any, List
 import numpy as np
@@ -104,7 +105,6 @@ class WeightedTrainer(HFTrainer):
         loss = self.loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
         return (loss, outputs) if return_outputs else loss
 
-
 def make_weighted_sampler(dataset, num_labels):
     labels = [int(ex["labels"]) for ex in dataset]
     counts = np.bincount(labels, minlength=num_labels).astype(float)
@@ -112,11 +112,25 @@ def make_weighted_sampler(dataset, num_labels):
     weights = [inv[y] for y in labels]
     return WeightedRandomSampler(weights, num_samples=len(labels), replacement=True)
 
+def save_matrix_csv(path: str, matrix: np.ndarray, id2label: Dict[int, str], fmt: str | None = None):
+    num_labels = matrix.shape[0]
+    labels = [id2label[i] for i in range(num_labels)]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([""] + labels)
+        for i in range(num_labels):
+            row = matrix[i]
+            if fmt is not None:
+                writer.writerow([labels[i]] + [format(x, fmt) for x in row])
+            else:
+                writer.writerow([labels[i]] + list(row))
+
 def main():
     # Safety
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     os.environ.setdefault("TRANSFORMERS_USE_SAFE_TENSORS", "1")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     all_ds = load_aiera_all()
     try:
@@ -264,9 +278,13 @@ def main():
         row = ["{:>10}".format(model.config.id2label[i])] + ["{:>10.2f}".format(cm_norm[i, j]) for j in range(num_labels)]
         print(" ".join(row))
 
+    raw_cm_csv = os.path.join(OUTPUT_DIR, "confusion_matrix.csv")
+    norm_cm_csv = os.path.join(OUTPUT_DIR, "confusion_matrix_normalized.csv")
+    save_matrix_csv(raw_cm_csv, cm.astype(int), model.config.id2label)
+    save_matrix_csv(norm_cm_csv, cm_norm.astype(float), model.config.id2label, fmt=".6f")
+
     trainer.save_model(OUTPUT_DIR)
     tok.save_pretrained(OUTPUT_DIR)
-
 
 if __name__ == "__main__":
     main()

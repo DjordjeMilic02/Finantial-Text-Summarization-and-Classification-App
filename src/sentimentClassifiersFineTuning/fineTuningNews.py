@@ -140,6 +140,19 @@ def read_opendatabay_csv(path: str) -> Dataset:
         "label": [r["label"] for r in rows],
     })
 
+def save_matrix_csv(path: str, matrix: np.ndarray, id2label: Dict[int, str], fmt: str | None = None):
+    num_labels = matrix.shape[0]
+    labels = [id2label[i] for i in range(num_labels)]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([""] + labels)
+        for i in range(num_labels):
+            row = matrix[i]
+            if fmt is not None:
+                writer.writerow([labels[i]] + [format(x, fmt) for x in row])
+            else:
+                writer.writerow([labels[i]] + list(row))
+
 def main():
     os.environ.setdefault("TRANSFORMERS_USE_SAFE_TENSORS", "1")
 
@@ -280,7 +293,7 @@ def main():
     refs_test = test_out.label_ids
     preds_thresh = np.where(neg_probs_test >= best_tau, neg_id, pos_id)
 
-    num_labels = 2
+    num_labels = len(id2label)
     cm = np.zeros((num_labels, num_labels), dtype=int)
     for p, r in zip(preds_thresh, refs_test):
         cm[r, p] += 1
@@ -304,8 +317,18 @@ def main():
 
     print(f"\nMacro-F1 (thresholded): {f1_thresh:.4f}")
 
+    raw_cm_csv = os.path.join(OUTPUT_DIR, "confusion_matrix.csv")
+    norm_cm_csv = os.path.join(OUTPUT_DIR, "confusion_matrix_normalized.csv")
+    save_matrix_csv(raw_cm_csv, cm.astype(int), model.config.id2label)
+    save_matrix_csv(norm_cm_csv, cm_norm.astype(float), model.config.id2label, fmt=".6f")
+
     trainer.save_model(OUTPUT_DIR)
     tok.save_pretrained(OUTPUT_DIR)
+
+    with open(os.path.join(OUTPUT_DIR, "threshold.txt"), "w", encoding="utf-8") as f:
+        f.write(f"NEGATIVE threshold (best_tau) = {best_tau:.6f}\n")
+        f.write(f"Validation macro-F1 at best_tau = {best_f1:.6f}\n")
+        f.write(f"Test macro-F1 (thresholded) = {f1_thresh:.6f}\n")
 
 if __name__ == "__main__":
     main()

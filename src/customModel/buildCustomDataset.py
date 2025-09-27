@@ -28,7 +28,6 @@ CURRENCIES = {"AUD","CAD","CHF","EUR","GBP","JPY","NZD","USD"}
 FLOAT_LINE_RE = re.compile(r"^[\s\+\-]?[0-9]+(?:[.,][0-9]+)?(?:\s*%?)\s*$")
 
 def read_custom_file(fp: Path) -> Tuple[Optional[float], str]:
-    """Reads one .txt file: first non-empty line as float (if parseable), rest as text."""
     with fp.open("r", encoding="utf-8", errors="ignore") as f:
         lines = [ln.rstrip("\n") for ln in f]
     first_idx = next((i for i,ln in enumerate(lines) if ln.strip() != ""), None)

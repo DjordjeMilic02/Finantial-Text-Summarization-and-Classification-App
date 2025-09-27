@@ -16,3 +16,5 @@ evaluate
 rouge_score
 nltk
 absl-py
+PySide6
+pypdf

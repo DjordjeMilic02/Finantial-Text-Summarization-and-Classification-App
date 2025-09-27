@@ -1,8 +1,25 @@
 import os
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("ACCELERATE_USE_DEVICE_MAP", "0")
+os.environ.setdefault("ACCELERATE_DISABLE_MMAP", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import sys
 import warnings
 from pathlib import Path
 from typing import Optional, Callable, Tuple
+
+_THIS_FILE = Path(__file__).resolve()
+_PROJECT_ROOT = _THIS_FILE.parents[1] if _THIS_FILE.parent.name == "src" else _THIS_FILE.parent
+_SRC_DIR = _PROJECT_ROOT / "src"
+for p in (str(_PROJECT_ROOT), str(_SRC_DIR)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -27,6 +44,11 @@ START_LABEL_MAP = {
 def lazy_import_transformers():
     from transformers import pipeline
     import torch
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
     return pipeline, torch
 
 def extract_text_from_pdf(path: Path) -> str:
@@ -126,6 +148,42 @@ class SummarizerWorker(QtCore.QThread):
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
 
+class CbCustomSummarizerWorker(QtCore.QThread):
+    done = QtCore.Signal(str)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        self.text = text
+
+    def _import_runner(self):
+        last_err = None
+        for mod_path in ("src.customSummarizer.customRunner", "customSummarizer.customRunner"):
+            try:
+                return __import__(mod_path, fromlist=["*"])
+            except ModuleNotFoundError as e:
+                last_err = e
+                continue
+        if last_err:
+            raise last_err
+        raise ModuleNotFoundError("customRunner not found.")
+
+    def run(self):
+        try:
+            if not self.text.strip():
+                self.failed.emit("No text to summarize.")
+                return
+            module = self._import_runner()
+            for name in ("summarize_cb_custom", "summarize_cb", "summarize"):
+                fn = getattr(module, name, None)
+                if callable(fn):
+                    out = fn(self.text)
+                    self.done.emit(out if isinstance(out, str) else str(out))
+                    return
+            self.failed.emit("No summarizer function found in customRunner.")
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
 class SentimentWorker(QtCore.QThread):
     done = QtCore.Signal(str, float)
     failed = QtCore.Signal(str)
@@ -173,7 +231,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Financial Text Analyzer")
+        self.setWindowTitle("Diplomski")
         self.resize(1500, 950)
 
         v_split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical, self)
@@ -212,12 +270,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_clear = QtWidgets.QPushButton("Clear")
         self.btn_clear.clicked.connect(self.clear_all)
         row.addWidget(self.btn_clear)
+
+        self.btn_run_start = QtWidgets.QPushButton("Run")
+        self.btn_run_start.clicked.connect(self.on_run_start_classifier)
+        row.addWidget(self.btn_run_start)
+
         row.addStretch(1)
         tl.addLayout(row)
 
-        hint = QtWidgets.QLabel("Tip: You can also drag & drop a .txt or .pdf file here.")
-        hint.setStyleSheet("color: #666;")
-        tl.addWidget(hint)
+        self.drop_frame = QtWidgets.QFrame()
+        self.drop_frame.setFixedHeight(120)
+        self.drop_frame.setStyleSheet("""
+            QFrame {
+                border: 2px dashed #aaa;
+                border-radius: 8px;
+                background: #a0a0a0;  /* greyer than before, but not too dark */
+            }
+        """)
+        self.drop_frame.setAcceptDrops(True)
+        self.drop_frame.dragEnterEvent = self._drag_enter
+        self.drop_frame.dropEvent = self._drop
+
+        drop_layout = QtWidgets.QVBoxLayout(self.drop_frame)
+        drop_layout.setContentsMargins(0, 0, 0, 0)
+        drop_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        drop_label = QtWidgets.QLabel("Drag & Drop area")
+        drop_label.setStyleSheet("color: #555; font-size: 13px;")
+        drop_layout.addWidget(drop_label)
+        tl.addWidget(self.drop_frame)
+
         tl.addStretch(1)
 
         self.upload_panel.setAcceptDrops(True)
@@ -243,6 +324,17 @@ class MainWindow(QtWidgets.QMainWindow):
         sm_box_layout.addWidget(self.summary_view)
         pr_layout.addWidget(self.summary_box, stretch=2)
 
+        self.cb_summary_box = QtWidgets.QGroupBox("Custom Summary")
+        cbsm_layout = QtWidgets.QVBoxLayout(self.cb_summary_box)
+        self.cb_summary_view = QtWidgets.QPlainTextEdit()
+        self.cb_summary_view.setReadOnly(True)
+        cbsm_layout.addWidget(self.cb_summary_view)
+        self.cb_summary_status = QtWidgets.QLabel("")
+        self.cb_summary_status.setStyleSheet("color: #666;")
+        cbsm_layout.addWidget(self.cb_summary_status)
+        self.cb_summary_box.setVisible(False)
+        pr_layout.addWidget(self.cb_summary_box, stretch=2)
+
         top_split.addWidget(self.upload_panel)
         top_split.addWidget(self.preview_summary)
         top_split.setStretchFactor(0, 1)
@@ -251,34 +343,26 @@ class MainWindow(QtWidgets.QMainWindow):
         bottom_left_stack = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         bottom_left_stack.setHandleWidth(6)
 
-        self.start_panel = QtWidgets.QGroupBox("Start Classifier (Routing)")
+        self.start_panel = QtWidgets.QGroupBox("Start Classifier")
         bl = QtWidgets.QGridLayout(self.start_panel)
         bl.setContentsMargins(12, 12, 12, 12)
         bl.setHorizontalSpacing(8)
         bl.setVerticalSpacing(10)
 
-        info = QtWidgets.QLabel(f"Model: {START_MODEL_PATH}")
-        info.setStyleSheet("color: #666;")
-        bl.addWidget(info, 0, 0, 1, 2)
-
-        self.btn_run_start = QtWidgets.QPushButton("Run on extracted text")
-        self.btn_run_start.clicked.connect(self.on_browse if False else self.on_run_start_classifier)
-        bl.addWidget(self.btn_run_start, 1, 0, 1, 2)
-
         self.lbl_class = QtWidgets.QLabel("Class: —")
         self.lbl_conf  = QtWidgets.QLabel("Confidence: —")
         self.lbl_status = QtWidgets.QLabel("")
         self.lbl_status.setStyleSheet("color: #666;")
-        bl.addWidget(self.lbl_class, 2, 0, 1, 2)
-        bl.addWidget(self.lbl_conf, 3, 0, 1, 2)
-        bl.addWidget(self.lbl_status, 4, 0, 1, 2)
+        bl.addWidget(self.lbl_class, 0, 0, 1, 2)
+        bl.addWidget(self.lbl_conf,  1, 0, 1, 2)
+        bl.addWidget(self.lbl_status,2, 0, 1, 2)
 
         self.sent_panel = QtWidgets.QGroupBox("Sentiment")
         sl = QtWidgets.QGridLayout(self.sent_panel)
         sl.setContentsMargins(12, 12, 12, 12)
         sl.setHorizontalSpacing(8)
         sl.setVerticalSpacing(10)
-        self.lbl_sent_label = QtWidgets.QLabel("Label: —")
+        self.lbl_sent_label = QtWidgets.QLabel("Class: —")
         self.lbl_sent_conf  = QtWidgets.QLabel("Confidence: —")
         self.lbl_sent_status = QtWidgets.QLabel("")
         self.lbl_sent_status.setStyleSheet("color: #666;")
@@ -286,12 +370,12 @@ class MainWindow(QtWidgets.QMainWindow):
         sl.addWidget(self.lbl_sent_conf,  1, 0, 1, 2)
         sl.addWidget(self.lbl_sent_status,2, 0, 1, 2)
 
-        self.cb_custom_panel = QtWidgets.QGroupBox("CB Custom Sentiment (HAN)")
+        self.cb_custom_panel = QtWidgets.QGroupBox("Custom Sentiment")
         cl = QtWidgets.QGridLayout(self.cb_custom_panel)
         cl.setContentsMargins(12, 12, 12, 12)
         cl.setHorizontalSpacing(8)
         cl.setVerticalSpacing(10)
-        self.lbl_cb_label = QtWidgets.QLabel("Label: —")
+        self.lbl_cb_label = QtWidgets.QLabel("Class: —")
         self.lbl_cb_conf  = QtWidgets.QLabel("Confidence: —")
         self.lbl_cb_status = QtWidgets.QLabel("")
         self.lbl_cb_status.setStyleSheet("color: #666;")
@@ -327,8 +411,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.worker = None
         self.sum_worker = None
+        self.cb_sum_worker = None
         self.sent_worker = None
         self.cb_worker = None
+
+        self.is_cb = False
 
     def on_browse(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -378,13 +465,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_conf.setText("Confidence: —")
             self.lbl_status.setText("")
             self.sent_panel.setTitle("Sentiment")
-            self.lbl_sent_label.setText("Label: —")
+            self.lbl_sent_label.setText("Class: —")
             self.lbl_sent_conf.setText("Confidence: —")
             self.lbl_sent_status.setText("")
             self.cb_custom_panel.setVisible(False)
-            self.lbl_cb_label.setText("Label: —")
+            self.lbl_cb_label.setText("Class: —")
             self.lbl_cb_conf.setText("Confidence: —")
             self.lbl_cb_status.setText("")
+            self.cb_summary_box.setVisible(False)
+            self.cb_summary_view.clear()
+            self.cb_summary_status.setText("")
+            self.is_cb = False
 
             self.append_log(f"[OK] Loaded {path.name} ({len(text)} chars).")
         except Exception as e:
@@ -400,13 +491,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_conf.setText("Confidence: —")
         self.lbl_status.setText("")
         self.sent_panel.setTitle("Sentiment")
-        self.lbl_sent_label.setText("Label: —")
+        self.lbl_sent_label.setText("Class: —")
         self.lbl_sent_conf.setText("Confidence: —")
         self.lbl_sent_status.setText("")
         self.cb_custom_panel.setVisible(False)
-        self.lbl_cb_label.setText("Label: —")
+        self.lbl_cb_label.setText("Class: —")
         self.lbl_cb_conf.setText("Confidence: —")
         self.lbl_cb_status.setText("")
+        self.cb_summary_box.setVisible(False)
+        self.cb_summary_view.clear()
+        self.cb_summary_status.setText("")
+        self.is_cb = False
         self.append_log("[INFO] Cleared.")
 
     def on_run_start_classifier(self):
@@ -442,42 +537,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_class_name = class_name or "News"
         self.lbl_class.setText(f"Class: {self.last_class_name}")
         self.lbl_conf.setText(f"Confidence: {conf:.4f}")
-        self.lbl_status.setText("Classification complete. Starting summarizer & sentiment…")
+        self.lbl_status.setText("Classification complete. Starting summarizer…")
         self.append_log(f"[OK] Predicted: {self.last_class_name}  |  confidence={conf:.4f}")
+
+        cls = (self.last_class_name or "").lower()
+        self.is_cb = ("central" in cls or "bank" in cls or "speech" in cls)
 
         self.summary_view.setPlainText(f"[RUN] Summarizing ({self.last_class_name}) …")
         self.sum_worker = SummarizerWorker(self.last_class_name, self.current_text, self)
         self.sum_worker.done.connect(self._on_summary_done, QtCore.Qt.ConnectionType.UniqueConnection)
         self.sum_worker.failed.connect(self._on_summary_failed, QtCore.Qt.ConnectionType.UniqueConnection)
         self.sum_worker.start()
-
-        cls = (self.last_class_name or "").lower()
-        if "central" in cls or "bank" in cls or "speech" in cls:
-            self.sent_panel.setTitle("Sentiment (DeBERTa)")
-            self.lbl_sent_status.setText("Running sentiment (DeBERTa)…")
-            self.sent_worker = SentimentWorker(self.last_class_name, self.current_text, None, self)
-            self.sent_worker.done.connect(self._on_sentiment_done, QtCore.Qt.ConnectionType.UniqueConnection)
-            self.sent_worker.failed.connect(self._on_sentiment_failed, QtCore.Qt.ConnectionType.UniqueConnection)
-            self.sent_worker.start()
-
-            self.cb_custom_panel.setVisible(True)
-            self.lbl_cb_status.setText("Running custom CB sentiment (HAN)…")
-            self.cb_worker = SentimentWorker(
-                self.last_class_name, self.current_text,
-                module_override="sentimentClassifiers.runnerCustom",
-                parent=self
-            )
-            self.cb_worker.done.connect(self._on_cb_custom_done, QtCore.Qt.ConnectionType.UniqueConnection)
-            self.cb_worker.failed.connect(self._on_cb_custom_failed, QtCore.Qt.ConnectionType.UniqueConnection)
-            self.cb_worker.start()
-        else:
-            self.sent_panel.setTitle("Sentiment")
-            self.lbl_sent_status.setText("Running sentiment…")
-            self.cb_custom_panel.setVisible(False)
-            self.sent_worker = SentimentWorker(self.last_class_name, self.current_text, None, self)
-            self.sent_worker.done.connect(self._on_sentiment_done, QtCore.Qt.ConnectionType.UniqueConnection)
-            self.sent_worker.failed.connect(self._on_sentiment_failed, QtCore.Qt.ConnectionType.UniqueConnection)
-            self.sent_worker.start()
 
     @QtCore.Slot(str)
     def _on_summary_done(self, summary: str):
@@ -486,7 +556,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if not summary.strip():
             summary = "[No summary produced.]"
         self.summary_view.setPlainText(summary)
-        self.lbl_status.setText("Done.")
         self.append_log("[OK] Summarization complete.")
         try:
             self.sum_worker.done.disconnect(self._on_summary_done)
@@ -495,12 +564,23 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.sum_worker = None
 
+        if self.is_cb:
+            self.cb_summary_box.setVisible(True)
+            self.cb_summary_view.setPlainText("[RUN] Custom summarizer …")
+            self.cb_summary_status.setText("Running custom summarizer …")
+            self.lbl_status.setText("Starting custom summarizer…")
+            self.cb_sum_worker = CbCustomSummarizerWorker(self.current_text, self)
+            self.cb_sum_worker.done.connect(self._on_cb_summary_done, QtCore.Qt.ConnectionType.UniqueConnection)
+            self.cb_sum_worker.failed.connect(self._on_cb_summary_failed, QtCore.Qt.ConnectionType.UniqueConnection)
+            self.cb_sum_worker.start()
+        else:
+            self._start_primary_sentiment()
+
     @QtCore.Slot(str)
     def _on_summary_failed(self, err: str):
         if self.sender() is not getattr(self, "sum_worker", None):
             return
         self.summary_view.setPlainText("[Failed to summarize]")
-        self.lbl_status.setText("Summarizer error.")
         self.append_log(f"[ERROR] Summarizer failed: {err}")
         try:
             self.sum_worker.done.disconnect(self._on_summary_done)
@@ -509,11 +589,67 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.sum_worker = None
 
+        if self.is_cb:
+            self.cb_summary_box.setVisible(True)
+            self.cb_summary_view.setPlainText("[RUN] Custom summarizer …")
+            self.cb_summary_status.setText("Running custom summarizer …")
+            self.lbl_status.setText("Summarizer error. Starting custom summarizer…")
+            self.cb_sum_worker = CbCustomSummarizerWorker(self.current_text, self)
+            self.cb_sum_worker.done.connect(self._on_cb_summary_done, QtCore.Qt.ConnectionType.UniqueConnection)
+            self.cb_sum_worker.failed.connect(self._on_cb_summary_failed, QtCore.Qt.ConnectionType.UniqueConnection)
+            self.cb_sum_worker.start()
+        else:
+            self._start_primary_sentiment()
+
+    def _start_primary_sentiment(self):
+        self.sent_panel.setTitle("Sentiment")
+        self.lbl_sent_status.setText("Running sentiment…")
+
+        self.lbl_status.setText("Starting sentiment…")
+        self.sent_worker = SentimentWorker(self.last_class_name, self.current_text, None, self)
+        self.sent_worker.done.connect(self._on_sentiment_done, QtCore.Qt.ConnectionType.UniqueConnection)
+        self.sent_worker.failed.connect(self._on_sentiment_failed, QtCore.Qt.ConnectionType.UniqueConnection)
+        self.sent_worker.start()
+
+    @QtCore.Slot(str)
+    def _on_cb_summary_done(self, summary: str):
+        if self.sender() is not getattr(self, "cb_sum_worker", None):
+            return
+        if not summary.strip():
+            summary = "[No summary produced.]"
+        self.cb_summary_view.setPlainText(summary)
+        self.cb_summary_status.setText("Done.")
+        self.append_log("[OK] Custom summarization complete.")
+        try:
+            self.cb_sum_worker.done.disconnect(self._on_cb_summary_done)
+            self.cb_sum_worker.failed.disconnect(self._on_cb_summary_failed)
+        except Exception:
+            pass
+        self.cb_sum_worker = None
+
+        self._start_primary_sentiment()
+
+    @QtCore.Slot(str)
+    def _on_cb_summary_failed(self, err: str):
+        if self.sender() is not getattr(self, "cb_sum_worker", None):
+            return
+        self.cb_summary_view.setPlainText("[Failed to summarize (custom)]")
+        self.cb_summary_status.setText("Error.")
+        self.append_log(f"[ERROR] Custom summarizer failed: {err}")
+        try:
+            self.cb_sum_worker.done.disconnect(self._on_cb_summary_done)
+            self.cb_sum_worker.failed.disconnect(self._on_cb_summary_failed)
+        except Exception:
+            pass
+        self.cb_sum_worker = None
+
+        self._start_primary_sentiment()
+
     @QtCore.Slot(str, float)
     def _on_sentiment_done(self, label: str, conf: float):
         if self.sender() is not getattr(self, "sent_worker", None):
             return
-        self.lbl_sent_label.setText(f"Label: {label or '—'}")
+        self.lbl_sent_label.setText(f"Class: {label or '—'}")
         self.lbl_sent_conf.setText(f"Confidence: {conf:.4f}" if label else "Confidence: —")
         self.lbl_sent_status.setText("Done.")
         self.append_log(f"[OK] Sentiment: {label}  |  confidence={conf:.4f}")
@@ -524,11 +660,26 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.sent_worker = None
 
+        if self.is_cb:
+            self.cb_custom_panel.setVisible(True)
+            self.lbl_cb_status.setText("Running custom sentiment …")
+            self.lbl_status.setText("Starting custom sentiment…")
+            self.cb_worker = SentimentWorker(
+                self.last_class_name, self.current_text,
+                module_override="sentimentClassifiers.runnerCustom",
+                parent=self
+            )
+            self.cb_worker.done.connect(self._on_cb_custom_done, QtCore.Qt.ConnectionType.UniqueConnection)
+            self.cb_worker.failed.connect(self._on_cb_custom_failed, QtCore.Qt.ConnectionType.UniqueConnection)
+            self.cb_worker.start()
+        else:
+            self.lbl_status.setText("Done.")
+
     @QtCore.Slot(str)
     def _on_sentiment_failed(self, err: str):
         if self.sender() is not getattr(self, "sent_worker", None):
             return
-        self.lbl_sent_label.setText("Label: —")
+        self.lbl_sent_label.setText("Class: —")
         self.lbl_sent_conf.setText("Confidence: —")
         self.lbl_sent_status.setText("Error.")
         self.append_log(f"[ERROR] Sentiment failed: {err}")
@@ -539,35 +690,52 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.sent_worker = None
 
+        if self.is_cb:
+            self.cb_custom_panel.setVisible(True)
+            self.lbl_cb_status.setText("Running custom sentiment …")
+            self.lbl_status.setText("Starting custom sentiment…")
+            self.cb_worker = SentimentWorker(
+                self.last_class_name, self.current_text,
+                module_override="sentimentClassifiers.runnerCustom",
+                parent=self
+            )
+            self.cb_worker.done.connect(self._on_cb_custom_done, QtCore.Qt.ConnectionType.UniqueConnection)
+            self.cb_worker.failed.connect(self._on_cb_custom_failed, QtCore.Qt.ConnectionType.UniqueConnection)
+            self.cb_worker.start()
+        else:
+            self.lbl_status.setText("Done with errors.")
+
     @QtCore.Slot(str, float)
     def _on_cb_custom_done(self, label: str, conf: float):
         if self.sender() is not getattr(self, "cb_worker", None):
             return
-        self.lbl_cb_label.setText(f"Label: {label or '—'}")
+        self.lbl_cb_label.setText(f"Class: {label or '—'}")
         self.lbl_cb_conf.setText(f"Confidence: {conf:.4f}" if label else "Confidence: —")
         self.lbl_cb_status.setText("Done.")
-        self.append_log(f"[OK] CB Custom Sentiment (HAN): {label}  |  confidence={conf:.4f}")
+        self.append_log(f"[OK] Custom Sentiment: {label}  |  confidence={conf:.4f}")
         try:
             self.cb_worker.done.disconnect(self._on_cb_custom_done)
             self.cb_worker.failed.disconnect(self._on_cb_custom_failed)
         except Exception:
             pass
         self.cb_worker = None
+        self.lbl_status.setText("Done.")
 
     @QtCore.Slot(str)
     def _on_cb_custom_failed(self, err: str):
         if self.sender() is not getattr(self, "cb_worker", None):
             return
-        self.lbl_cb_label.setText("Label: —")
+        self.lbl_cb_label.setText("Class: —")
         self.lbl_cb_conf.setText("Confidence: —")
         self.lbl_cb_status.setText("Error.")
-        self.append_log(f"[ERROR] CB Custom Sentiment failed: {err}")
+        self.append_log(f"[ERROR] Custom Sentiment failed: {err}")
         try:
             self.cb_worker.done.disconnect(self._on_cb_custom_done)
             self.cb_worker.failed.disconnect(self._on_cb_custom_failed)
         except Exception:
             pass
         self.cb_worker = None
+        self.lbl_status.setText("Done with errors.")
 
     def append_log(self, msg: str):
         self.log.appendPlainText(msg)
@@ -577,7 +745,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    app.setApplicationName("Financial Text Analyzer")
+    app.setApplicationName("Diplomski")
     app.setStyle("Fusion")
     w = MainWindow()
     w.show()

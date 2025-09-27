@@ -1,4 +1,5 @@
 import os
+import csv
 import argparse
 from typing import Dict, Any, List
 from collections import Counter
@@ -124,12 +125,25 @@ def make_weighted_sampler(dataset, num_labels):
     weights = [inv[y] for y in labels]
     return WeightedRandomSampler(weights, num_samples=len(labels), replacement=True)
 
+def save_matrix_csv(path: str, matrix: np.ndarray, id2label: Dict[int, str], fmt: str = None):
+    num_labels = matrix.shape[0]
+    labels = [id2label[i] for i in range(num_labels)]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([""] + labels)
+        for i in range(num_labels):
+            row = matrix[i]
+            if fmt is not None:
+                writer.writerow([labels[i]] + [format(x, fmt) for x in row])
+            else:
+                writer.writerow([labels[i]] + list(row))
 
 def main():
     args = build_args()
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     os.environ.setdefault("TRANSFORMERS_USE_SAFE_TENSORS", "1")
+    os.makedirs(args.output_dir, exist_ok=True)
 
     all_ds = load_flare_fomc_all()
     try:
@@ -276,6 +290,11 @@ def main():
     for i in range(num_labels):
         row = ["{:>10}".format(model.config.id2label[i])] + ["{:>10.2f}".format(cm_norm[i, j]) for j in range(num_labels)]
         print(" ".join(row))
+
+    raw_cm_csv = os.path.join(args.output_dir, "confusion_matrix.csv")
+    norm_cm_csv = os.path.join(args.output_dir, "confusion_matrix_normalized.csv")
+    save_matrix_csv(raw_cm_csv, cm.astype(int), model.config.id2label)
+    save_matrix_csv(norm_cm_csv, cm_norm.astype(float), model.config.id2label, fmt=".6f")
 
     trainer.save_model(args.output_dir)
     tok.save_pretrained(args.output_dir)
