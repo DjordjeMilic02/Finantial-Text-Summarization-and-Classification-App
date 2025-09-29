@@ -91,6 +91,22 @@ def stratified_split(idxs_by_lbl: Dict[str, List[int]], test_ratio=0.1, val_rati
         train_idx.extend(idxs[n_test+n_val:].tolist())
     return train_idx, val_idx, test_idx
 
+def encode_doc(text: str, stoi: Dict[str,int]) -> List[List[int]]:
+    sents = split_sentences(text)
+    ids_2d = []
+    for s in sents[:MAX_SENTS]:
+        toks = tokenize(s)
+        ids = encode_tokens(toks, stoi)
+        if len(ids) < MAX_WORDS:
+            ids = ids + [PAD_IDX] * (MAX_WORDS - len(ids))
+        else:
+            ids = ids[:MAX_WORDS]
+        ids_2d.append(ids)
+    if len(ids_2d) < MAX_SENTS:
+        pad_sent = [PAD_IDX]*MAX_WORDS
+        ids_2d += [pad_sent]*(MAX_SENTS - len(ids_2d))
+    return ids_2d
+
 def stratified_val_split(labels: List[str], val_ratio=0.10, seed=SEED):
     rng = np.random.default_rng(seed)
     by = defaultdict(list)
@@ -116,22 +132,6 @@ def build_vocab(tokenized_docs: List[List[str]], max_vocab=MAX_VOCAB, min_freq=M
 
 def encode_tokens(tokens: List[str], stoi: Dict[str,int]) -> List[int]:
     return [stoi.get(t, UNK_IDX) for t in tokens]
-
-def encode_doc(text: str, stoi: Dict[str,int]) -> List[List[int]]:
-    sents = split_sentences(text)
-    ids_2d = []
-    for s in sents[:MAX_SENTS]:
-        toks = tokenize(s)
-        ids = encode_tokens(toks, stoi)
-        if len(ids) < MAX_WORDS:
-            ids = ids + [PAD_IDX] * (MAX_WORDS - len(ids))
-        else:
-            ids = ids[:MAX_WORDS]
-        ids_2d.append(ids)
-    if len(ids_2d) < MAX_SENTS:
-        pad_sent = [PAD_IDX]*MAX_WORDS
-        ids_2d += [pad_sent]*(MAX_SENTS - len(ids_2d))
-    return ids_2d
 
 class HanDataset(torch.utils.data.Dataset):
     def __init__(self, docs_ids_2d: List[List[List[int]]], labels: List[int], train: bool):

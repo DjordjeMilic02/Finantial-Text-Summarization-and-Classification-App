@@ -13,6 +13,7 @@ import sys
 import warnings
 from pathlib import Path
 from typing import Optional, Callable, Tuple
+from enum import Enum, auto
 
 _THIS_FILE = Path(__file__).resolve()
 _PROJECT_ROOT = _THIS_FILE.parents[1] if _THIS_FILE.parent.name == "src" else _THIS_FILE.parent
@@ -65,10 +66,13 @@ def extract_text_from_pdf(path: Path) -> str:
     return "\n\n".join(text_parts).strip()
 
 class StartClassifierWorker(QtCore.QThread):
+    progress = QtCore.Signal(int, str)
     done = QtCore.Signal(str, float, str)
+
     def __init__(self, text: str, parent=None):
         super().__init__(parent)
         self.text = text
+
     def _humanize(self, raw_label: str) -> str:
         if raw_label.startswith("LABEL_"):
             try:
@@ -84,6 +88,22 @@ class StartClassifierWorker(QtCore.QThread):
         if "news" in low:
             return "News"
         return raw_label
+
+    def _split_into_chunks(self, text: str, target_chars: int = 1900, min_chunk: int = 500):
+        text = (text or "").strip()
+        if not text:
+            return []
+        if len(text) <= target_chars:
+            return [text]
+        parts, buf, cur = [], [], 0
+        for para in (p for p in text.split("\n") if p.strip()):
+            if cur + len(para) + 1 <= target_chars or cur < min_chunk:
+                buf.append(para); cur += len(para) + 1
+            else:
+                parts.append("\n".join(buf)); buf = [para]; cur = len(para) + 1
+        if buf: parts.append("\n".join(buf))
+        return parts
+
     def run(self):
         try:
             if not self.text.strip():
@@ -93,14 +113,47 @@ class StartClassifierWorker(QtCore.QThread):
             if not Path(mp).exists():
                 self.done.emit("", 0.0, f"Model path not found: {mp}")
                 return
-            pipeline, torch = lazy_import_transformers()
-            device = 0 if torch.cuda.is_available() else -1
-            clf = pipeline("text-classification", model=mp, tokenizer=mp, device=device)
-            out = clf(self.text, truncation=True, max_length=512)[0]
-            raw_label = str(out.get("label", ""))
-            score = float(out.get("score", 0.0))
-            pretty = self._humanize(raw_label)
-            self.done.emit(pretty, score, "")
+
+            self.progress.emit(5, "Initializing model…")
+            from transformers import AutoTokenizer, AutoModelForSequenceClassification
+            import torch
+            try:
+                torch.set_num_threads(1); torch.set_num_interop_threads(1)
+            except Exception:
+                pass
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            tokenizer = AutoTokenizer.from_pretrained(mp, use_fast=True)
+            model = AutoModelForSequenceClassification.from_pretrained(mp).to(device)
+            model.eval()
+            id2label = getattr(model.config, "id2label", None)
+
+            chunks = self._split_into_chunks(self.text, target_chars=1900, min_chunk=500)
+            if not chunks:
+                self.done.emit("", 0.0, "No text to classify.")
+                return
+
+            total = len(chunks)
+            sum_logits = None
+            self.progress.emit(10, f"Classifying (0/{total})…")
+            with torch.no_grad():
+                for i, chunk in enumerate(chunks, start=1):
+                    enc = tokenizer(chunk, return_tensors="pt", truncation=True, max_length=512, padding=False)
+                    enc = {k: v.to(device) for k, v in enc.items()}
+                    out = model(**enc)
+                    logits = out.logits
+                    sum_logits = logits.detach().cpu() if sum_logits is None else (sum_logits + logits.detach().cpu())
+                    pct = 10 + int(85 * (i / total))
+                    self.progress.emit(pct, f"Classifying ({i}/{total})…")
+
+            mean_logits = (sum_logits / float(total)).squeeze(0)
+            prob = torch.nn.functional.softmax(mean_logits, dim=-1)
+            conf, pred_id = torch.max(prob, dim=-1)
+            pred_id = int(pred_id.item()); conf = float(conf.item())
+            raw_label = id2label.get(pred_id, f"LABEL_{pred_id}") if isinstance(id2label, dict) else f"LABEL_{pred_id}"
+            pretty = self._humanize(str(raw_label))
+            self.progress.emit(100, "Classification complete.")
+            self.done.emit(pretty, conf, "")
         except Exception as e:
             self.done.emit("", 0.0, f"{type(e).__name__}: {e}")
 
@@ -227,6 +280,13 @@ class SentimentWorker(QtCore.QThread):
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
 
+class Stage(Enum):
+    START = auto()
+    SUM = auto()
+    CB_SUM = auto()
+    SENT = auto()
+    CB_SENT = auto()
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -278,13 +338,19 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addStretch(1)
         tl.addLayout(row)
 
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        tl.addWidget(self.progress_bar)
+
         self.drop_frame = QtWidgets.QFrame()
         self.drop_frame.setFixedHeight(120)
         self.drop_frame.setStyleSheet("""
             QFrame {
                 border: 2px dashed #aaa;
                 border-radius: 8px;
-                background: #a0a0a0;  /* greyer than before, but not too dark */
+                background: #a0a0a0;
             }
         """)
         self.drop_frame.setAcceptDrops(True)
@@ -417,6 +483,69 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.is_cb = False
 
+        self.stage_plan: Optional[dict[Stage, tuple[int, int]]] = None
+        self._anim_timer = QtCore.QTimer(self)
+        self._anim_timer.setInterval(120)
+        self._anim_timer.timeout.connect(self._tick_stage_anim)
+        self._anim_active_stage: Optional[Stage] = None
+        self._anim_cap_value: Optional[int] = None
+
+    def _configure_pipeline(self, assume_cb: bool):
+        """Define global ranges (0..100) each stage will occupy."""
+        if assume_cb:
+            self.stage_plan = {
+                Stage.START:  (0, 30),
+                Stage.SUM:    (30, 55),
+                Stage.CB_SUM: (55, 75),
+                Stage.SENT:   (75, 90),
+                Stage.CB_SENT:(90, 100),
+            }
+        else:
+            self.stage_plan = {
+                Stage.START:  (0, 45),
+                Stage.SUM:    (45, 80),
+                Stage.SENT:   (80, 100),
+            }
+
+    def _global_from_stage(self, stage: Stage, stage_pct: int) -> int:
+        lo, hi = self.stage_plan[stage]
+        stage_pct = max(0, min(100, int(stage_pct)))
+        return lo + int((hi - lo) * (stage_pct / 100.0))
+
+    def _set_global_progress(self, value: int, msg: str = ""):
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(max(0, min(100, int(value))))
+        if msg:
+            self.lbl_status.setText(msg)
+
+    def _start_stage_anim(self, stage: Stage, label: str):
+        self._stop_stage_anim()
+        self._anim_active_stage = stage
+        lo, hi = self.stage_plan[stage]
+        self._anim_cap_value = hi - 2
+        if self.progress_bar.value() < lo:
+            self._set_global_progress(lo, label)
+        else:
+            self.lbl_status.setText(label)
+        self._anim_timer.start()
+
+    def _tick_stage_anim(self):
+        if not self._anim_active_stage:
+            self._anim_timer.stop()
+            return
+        v = self.progress_bar.value()
+        if self._anim_cap_value is not None and v >= self._anim_cap_value:
+            return
+        self._set_global_progress(v + 1)
+
+    def _stop_stage_anim(self, finalize_stage: Optional[Stage] = None, label: str = ""):
+        self._anim_timer.stop()
+        if finalize_stage and self.stage_plan and finalize_stage in self.stage_plan:
+            _, hi = self.stage_plan[finalize_stage]
+            self._set_global_progress(hi, label)
+        self._anim_active_stage = None
+        self._anim_cap_value = None
+
     def on_browse(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select TXT or PDF", str(Path.cwd()),
@@ -477,6 +606,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cb_summary_status.setText("")
             self.is_cb = False
 
+            self._set_global_progress(0, "")
             self.append_log(f"[OK] Loaded {path.name} ({len(text)} chars).")
         except Exception as e:
             self.append_log(f"[ERROR] {type(e).__name__}: {e}")
@@ -502,6 +632,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_summary_view.clear()
         self.cb_summary_status.setText("")
         self.is_cb = False
+        self._set_global_progress(0, "")
         self.append_log("[INFO] Cleared.")
 
     def on_run_start_classifier(self):
@@ -515,14 +646,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.summary_view.setPlainText("Summarizer will run automatically after classification.")
         self.append_log(f"[RUN] Start Classifier using model: {START_MODEL_PATH}")
 
+        self._configure_pipeline(assume_cb=True)
+        self._set_global_progress(0, "Initializing…")
+
         self.worker = StartClassifierWorker(self.current_text, self)
+        self.worker.progress.connect(self._on_start_progress, QtCore.Qt.ConnectionType.UniqueConnection)
         self.worker.done.connect(self._on_start_done, QtCore.Qt.ConnectionType.UniqueConnection)
         self.worker.start()
+
+    @QtCore.Slot(int, str)
+    def _on_start_progress(self, stage_pct: int, msg: str):
+        if not self.stage_plan:
+            return
+        g = self._global_from_stage(Stage.START, stage_pct)
+        self._set_global_progress(g, msg)
 
     def _on_start_done(self, class_name: str, conf: float, error: str):
         if self.sender() is not getattr(self, "worker", None):
             return
         try:
+            self.worker.progress.disconnect(self._on_start_progress)
             self.worker.done.disconnect(self._on_start_done)
         except Exception:
             pass
@@ -543,7 +686,12 @@ class MainWindow(QtWidgets.QMainWindow):
         cls = (self.last_class_name or "").lower()
         self.is_cb = ("central" in cls or "bank" in cls or "speech" in cls)
 
+        self._configure_pipeline(assume_cb=self.is_cb)
+        end_start = self.stage_plan[Stage.START][1]
+        self._set_global_progress(end_start, "Classification complete.")
+
         self.summary_view.setPlainText(f"[RUN] Summarizing ({self.last_class_name}) …")
+        self._start_stage_anim(Stage.SUM, f"Summarizing ({self.last_class_name})…")
         self.sum_worker = SummarizerWorker(self.last_class_name, self.current_text, self)
         self.sum_worker.done.connect(self._on_summary_done, QtCore.Qt.ConnectionType.UniqueConnection)
         self.sum_worker.failed.connect(self._on_summary_failed, QtCore.Qt.ConnectionType.UniqueConnection)
@@ -564,11 +712,13 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.sum_worker = None
 
+        self._stop_stage_anim(finalize_stage=Stage.SUM, label="Summarization complete.")
         if self.is_cb:
             self.cb_summary_box.setVisible(True)
             self.cb_summary_view.setPlainText("[RUN] Custom summarizer …")
             self.cb_summary_status.setText("Running custom summarizer …")
             self.lbl_status.setText("Starting custom summarizer…")
+            self._start_stage_anim(Stage.CB_SUM, "Custom summarizing (CB)…")
             self.cb_sum_worker = CbCustomSummarizerWorker(self.current_text, self)
             self.cb_sum_worker.done.connect(self._on_cb_summary_done, QtCore.Qt.ConnectionType.UniqueConnection)
             self.cb_sum_worker.failed.connect(self._on_cb_summary_failed, QtCore.Qt.ConnectionType.UniqueConnection)
@@ -589,11 +739,13 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.sum_worker = None
 
+        self._stop_stage_anim(finalize_stage=Stage.SUM, label="Summarization failed.")
         if self.is_cb:
             self.cb_summary_box.setVisible(True)
             self.cb_summary_view.setPlainText("[RUN] Custom summarizer …")
             self.cb_summary_status.setText("Running custom summarizer …")
             self.lbl_status.setText("Summarizer error. Starting custom summarizer…")
+            self._start_stage_anim(Stage.CB_SUM, "Custom summarizing (CB)…")
             self.cb_sum_worker = CbCustomSummarizerWorker(self.current_text, self)
             self.cb_sum_worker.done.connect(self._on_cb_summary_done, QtCore.Qt.ConnectionType.UniqueConnection)
             self.cb_sum_worker.failed.connect(self._on_cb_summary_failed, QtCore.Qt.ConnectionType.UniqueConnection)
@@ -604,8 +756,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start_primary_sentiment(self):
         self.sent_panel.setTitle("Sentiment")
         self.lbl_sent_status.setText("Running sentiment…")
-
         self.lbl_status.setText("Starting sentiment…")
+        self._start_stage_anim(Stage.SENT, "Running sentiment…")
         self.sent_worker = SentimentWorker(self.last_class_name, self.current_text, None, self)
         self.sent_worker.done.connect(self._on_sentiment_done, QtCore.Qt.ConnectionType.UniqueConnection)
         self.sent_worker.failed.connect(self._on_sentiment_failed, QtCore.Qt.ConnectionType.UniqueConnection)
@@ -627,6 +779,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.cb_sum_worker = None
 
+        self._stop_stage_anim(finalize_stage=Stage.CB_SUM, label="Custom summarization complete.")
         self._start_primary_sentiment()
 
     @QtCore.Slot(str)
@@ -643,6 +796,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.cb_sum_worker = None
 
+        self._stop_stage_anim(finalize_stage=Stage.CB_SUM, label="Custom summarization failed.")
         self._start_primary_sentiment()
 
     @QtCore.Slot(str, float)
@@ -660,10 +814,12 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.sent_worker = None
 
+        self._stop_stage_anim(finalize_stage=Stage.SENT, label="Sentiment complete.")
         if self.is_cb:
             self.cb_custom_panel.setVisible(True)
             self.lbl_cb_status.setText("Running custom sentiment …")
             self.lbl_status.setText("Starting custom sentiment…")
+            self._start_stage_anim(Stage.CB_SENT, "Running custom sentiment…")
             self.cb_worker = SentimentWorker(
                 self.last_class_name, self.current_text,
                 module_override="sentimentClassifiers.runnerCustom",
@@ -674,6 +830,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cb_worker.start()
         else:
             self.lbl_status.setText("Done.")
+            self._set_global_progress(100, "Done.")
 
     @QtCore.Slot(str)
     def _on_sentiment_failed(self, err: str):
@@ -690,10 +847,12 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.sent_worker = None
 
+        self._stop_stage_anim(finalize_stage=Stage.SENT, label="Sentiment failed.")
         if self.is_cb:
             self.cb_custom_panel.setVisible(True)
             self.lbl_cb_status.setText("Running custom sentiment …")
             self.lbl_status.setText("Starting custom sentiment…")
+            self._start_stage_anim(Stage.CB_SENT, "Running custom sentiment…")
             self.cb_worker = SentimentWorker(
                 self.last_class_name, self.current_text,
                 module_override="sentimentClassifiers.runnerCustom",
@@ -704,6 +863,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cb_worker.start()
         else:
             self.lbl_status.setText("Done with errors.")
+            self._set_global_progress(100, "Done with errors.")
 
     @QtCore.Slot(str, float)
     def _on_cb_custom_done(self, label: str, conf: float):
@@ -720,6 +880,8 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.cb_worker = None
         self.lbl_status.setText("Done.")
+        self._stop_stage_anim(finalize_stage=Stage.CB_SENT, label="Custom sentiment complete.")
+        self._set_global_progress(100, "Done.")
 
     @QtCore.Slot(str)
     def _on_cb_custom_failed(self, err: str):
@@ -736,6 +898,8 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.cb_worker = None
         self.lbl_status.setText("Done with errors.")
+        self._stop_stage_anim(finalize_stage=Stage.CB_SENT, label="Custom sentiment failed.")
+        self._set_global_progress(100, "Done with errors.")
 
     def append_log(self, msg: str):
         self.log.appendPlainText(msg)

@@ -126,7 +126,6 @@ def save_matrix_csv(path: str, matrix: np.ndarray, id2label: Dict[int, str], fmt
                 writer.writerow([labels[i]] + list(row))
 
 def main():
-    # Safety
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     os.environ.setdefault("TRANSFORMERS_USE_SAFE_TENSORS", "1")
